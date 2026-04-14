@@ -8,7 +8,7 @@ import { generateLandingPage } from './landing';
 
 const manifest = {
     id: 'org.selfvix.simple',
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'SelfVix🤌',
     description: 'Self VixSrc and VixCloud',
     logo: 'https://icv.stremio.dpdns.org/prisonmike.png',
@@ -249,6 +249,29 @@ app.get('/proxy/hls/manifest.m3u8', async (req: any, res: any) => {
     }
 });
 
+/**
+ * Some providers prepend a fake 8-byte PNG signature to TS segments.
+ * Strip it only when bytes after the header still match TS sync markers.
+ */
+function stripFakePngHeader(content: Buffer): Buffer {
+    const pngSig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    if (content.length <= 8 || !content.subarray(0, 8).equals(pngSig)) {
+        return content;
+    }
+
+    const tsPayload = content.subarray(8);
+    // MPEG-TS sync byte is 0x47
+    if (tsPayload.length === 0 || tsPayload[0] !== 0x47) {
+        return content;
+    }
+    if (tsPayload.length > 188 && tsPayload[188] !== 0x47) {
+        return content;
+    }
+
+    console.log(`[HLS Proxy] Removed fake PNG header from TS segment (${content.length} -> ${tsPayload.length} bytes)`);
+    return tsPayload;
+}
+
 // ── HLS Proxy: segment proxy ──
 app.get('/proxy/hls/segment.ts', async (req: any, res: any) => {
     try {
@@ -276,7 +299,8 @@ app.get('/proxy/hls/segment.ts', async (req: any, res: any) => {
         for await (const chunk of body) {
             chunks.push(Buffer.from(chunk));
         }
-        res.send(Buffer.concat(chunks));
+        const fullBuffer = Buffer.concat(chunks);
+        res.send(stripFakePngHeader(fullBuffer));
     } catch (e: any) {
         console.error('[HLS Segment Proxy] error:', e?.message || e);
         res.status(500).send('Internal error');

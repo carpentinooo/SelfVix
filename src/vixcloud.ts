@@ -180,70 +180,94 @@ async function getEmbedUrl(animePath: string, episodeNum: number): Promise<strin
 async function extractVixCloudManifest(embedUrl: string): Promise<string | null> {
     console.log(`[VixCloud] Extracting manifest from embed: ${embedUrl}`);
     
-    const { body } = await request(embedUrl, {
+    // Parse input URL for fallback tokens
+    const inputUrlObj = new URL(embedUrl);
+    const tokenFromInput = inputUrlObj.searchParams.get('token');
+    const expiresFromInput = inputUrlObj.searchParams.get('expires');
+    const asnFromInput = inputUrlObj.searchParams.get('asn');
+
+    const { body, statusCode } = await request(embedUrl, {
         headers: VIXCLOUD_HEADERS
     });
-    const html = await body.text();
+
+    let html = "";
+    if (statusCode === 200) {
+        html = await body.text();
+    } else if (statusCode === 403 && tokenFromInput && expiresFromInput) {
+        console.log("[VixCloud] 403 Received, but tokens provided in URL. Using fallback.");
+    } else {
+        console.log(`[VixCloud] Embed fetch failed with status ${statusCode}`);
+        return null;
+    }
     
-    // Direct regex extraction from window.masterPlaylist block
-    // Format: window.masterPlaylist = { params: { 'token': '...', 'expires': '...' }, url: '...' }
+    // Extract components from script
+    let token = tokenFromInput || "";
+    let expires = expiresFromInput || "";
+    let asn = asnFromInput || "";
+    let playlistUrl = "";
+
+    // Regex for window.masterPlaylist block
+    const masterPlaylistMatch = html.match(/window\.masterPlaylist\s*=\s*\{.*?params\s*:\s*\{(?<params>.*?)\}\s*,\s*url\s*:\s*['"](?<url>[^'"]+)['"]/s);
     
-    // Extract token (single or double quotes)
-    const tokenMatch = html.match(/['"]token['"]\s*:\s*['"]([^'"]+)['"]/);
-    const expiresMatch = html.match(/['"]expires['"]\s*:\s*['"]([^'"]+)['"]/);
-    
-    // Extract masterPlaylist URL (more robust regex)
-    const urlMatch = html.match(/masterPlaylist\s*=\s*\{.*?url\s*:\s*['"]([^'"]+)['"]/s);
-    
-    // Check canPlayFHD
-    const canFHD = /canPlayFHD\s*=\s*true/i.test(html);
-    
-    if (!tokenMatch || !expiresMatch || !urlMatch) {
-        console.log(`[VixCloud] Extraction failed: token=${!!tokenMatch} expires=${!!expiresMatch} url=${!!urlMatch}`);
+    if (masterPlaylistMatch?.groups) {
+        const paramsBlock = masterPlaylistMatch.groups.params;
+        playlistUrl = masterPlaylistMatch.groups.url.replace(/\\/g, '');
         
-        // Last resort: try window.streams for a direct playlist URL
-        const streamsMatch = html.match(/window\.streams\s*=\s*(\[[\s\S]*?\]);/);
-        if (streamsMatch) {
-            try {
-                const streams = JSON.parse(streamsMatch[1]);
-                const active = streams.find((s: any) => s.active) || streams[0];
-                if (active?.url) {
-                    let streamUrl = active.url;
-                    if (tokenMatch) streamUrl += `&token=${tokenMatch[1]}`;
-                    if (expiresMatch) streamUrl += `&expires=${expiresMatch[1]}`;
-                    if (canFHD) streamUrl += '&h=1';
-                    console.log(`[VixCloud] Using streams fallback: ${streamUrl}`);
-                    return ensureM3u8(streamUrl);
-                }
-            } catch {}
+        const tMatch = paramsBlock.match(/['"]token['"]\s*:\s*['"]([^'"]+)['"]/);
+        const eMatch = paramsBlock.match(/['"]expires['"]\s*:\s*['"]([^'"]+)['"]/);
+        const aMatch = paramsBlock.match(/['"]asn['"]\s*:\s*['"]([^'"]+)['"]/);
+        
+        if (tMatch) token = tMatch[1];
+        if (eMatch) expires = eMatch[1];
+        if (aMatch) asn = aMatch[1];
+    } else {
+        // Fallback regex patterns (match Python implementation)
+        const urlMatch = html.match(/masterPlaylist[\s\S]*?url\s*:\s*['"]([^'"]+)['"]/) || html.match(/url\s*:\s*['"](https?:[^'"]+\/playlist\/[^'"]+)['"]/);
+        const tMatch = html.match(/token['"]\s*:\s*['"]([^'"]+)['"]/);
+        const eMatch = html.match(/expires['"]\s*:\s*['"](\d+)['"]/);
+        const aMatch = html.match(/asn['"]\s*:\s*['"]([^'"]*)['"]/);
+
+        if (urlMatch) playlistUrl = urlMatch[1].replace(/\\/g, '');
+        if (tMatch && !token) token = tMatch[1];
+        if (eMatch && !expires) expires = eMatch[1];
+        if (aMatch && !asn) asn = aMatch[1];
+    }
+
+    // Build fallback playlist URL if missing
+    if (!playlistUrl) {
+        const videoIdMatch = embedUrl.match(/\/embed\/(\d+)/);
+        if (videoIdMatch) {
+            playlistUrl = `${inputUrlObj.origin}/playlist/${videoIdMatch[1]}`;
         }
-        
+    }
+
+    if (!token || !expires || !playlistUrl) {
+        console.log(`[VixCloud] Extraction failed: token=${!!token} expires=${!!expires} url=${!!playlistUrl}`);
         return null;
     }
 
-    const token = tokenMatch[1];
-    const expires = expiresMatch[1];
-    let baseUrl = urlMatch[1].replace(/\\/g, '');
+    // Build final URL
+    const finalUrlObj = new URL(playlistUrl);
+    finalUrlObj.searchParams.set('token', token);
+    finalUrlObj.searchParams.set('expires', expires);
+    if (asn) finalUrlObj.searchParams.set('asn', asn);
     
-    // Build final URL with params
-    const sep = baseUrl.includes('?') ? '&' : '?';
-    let finalUrl = `${baseUrl}${sep}token=${encodeURIComponent(token)}&expires=${encodeURIComponent(expires)}`;
-    if (canFHD) finalUrl += '&h=1';
-    
-    console.log(`[VixCloud] Extracted manifest: ${finalUrl}`);
-    return ensureM3u8(finalUrl);
+    // Check FHD
+    const canFHD = /canPlayFHD\s*=\s*true/i.test(html) || inputUrlObj.searchParams.get('canPlayFHD') === '1';
+    if (canFHD) finalUrlObj.searchParams.set('h', '1');
+
+    console.log(`[VixCloud] Extracted manifest: ${finalUrlObj.toString()}`);
+    return ensureM3u8(finalUrlObj.toString());
 }
 
 function ensureM3u8(url: string): string {
     try {
         const u = new URL(url);
-        const parts = u.pathname.split('/');
-        const idx = parts.indexOf('playlist');
-        if (idx !== -1 && idx < parts.length - 1) {
-            const leaf = parts[idx + 1] || '';
-            if (!/\.m3u8$/i.test(leaf) && !leaf.includes('.')) {
-                parts[idx + 1] = leaf + '.m3u8';
-                u.pathname = parts.join('/');
+        if (u.pathname.includes('/playlist/')) {
+            const parts = u.pathname.split('/');
+            const leaf = parts[parts.length - 1];
+            if (leaf && !leaf.includes('.') && !leaf.endsWith('.m3u8')) {
+                u.pathname = u.pathname + '.m3u8';
                 return u.toString();
             }
         }
