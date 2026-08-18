@@ -1,5 +1,6 @@
 # SelfVix🤌 Addon
 
+
 Addon leggero e standalone per Stremio che estrae e riproduce contenuti da VixSrc e VixCloud con proxy HLS integrato e logica "Synthetic FHD".
 
 ## Funzionalità
