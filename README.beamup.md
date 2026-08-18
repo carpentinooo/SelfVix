@@ -1,3 +1,4 @@
+test
  # 🚀 Deploy su BeamUp (Stremio) via GitHub Actions
 
 Questa guida ti spiega come configurare il deploy automatico su **BeamUp** sfruttando la GitHub Action ufficiale di Stremio.
